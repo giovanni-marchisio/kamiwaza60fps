@@ -224,12 +224,6 @@ Most loaders ignore this field for EXE files, but anti-cheat or
 integrity-checking systems that verify the checksum will reject the
 patched executable.
 
-### Cloudflare tunnel URL is ephemeral
-
-The FileVault tunnel used to deliver this patch produces a new random
-URL on every daemon restart. The URL printed when the patch was
-delivered is no longer valid after a daemon restart.
-
 ---
 
 ## Rollback
