@@ -1,77 +1,99 @@
 #!/usr/bin/env python3
 """
-Kamiwaza: Way of the Thief - Framerate Cap Patcher (Proof of Concept)
+Kamiwaza: Way of the Thief - Combined Patcher (Proof of Concept)
 
-Lifts the engine's 30 FPS framerate cap to 60 FPS by patching five
-4-byte float constants in the .data section of the Windows PE executable.
+Applies both patches in a single pass:
+
+  1. Framerate cap patch (5 byte changes)
+     Lifts the engine's 30 FPS framerate cap to 60 FPS by editing
+     five 4-byte float constants in the .data section.
+
+  2. Cutscene desync patch (1 byte change)
+     Forces the engine to use variable-delta time stepping for
+     sequence evaluation, eliminating the audio-leads-animation
+     desync observed when running at 60 FPS.
+
+Idempotent: the script accepts both the original (unpatched) bytes
+AND the already-patched bytes at each offset. If the input is
+already 60fps-patched (e.g. by patch_kamiwaza_60fps.py), this
+script will skip the already-applied FPS-cap patches and only
+apply the cutscene byte. If the input is fully unpatched, all
+six patches are applied.
 
 Usage:
-    python3 patch_kamiwaza_60fps.py <input.exe> [output.exe]
+    python3 patch_kamiwaza_combined.py <input.exe> [output.exe]
 
-If output path is omitted, the patched file is written next to the input
-as <input>.patched.exe. The input file is never modified.
+If output path is omitted, the patched file is written next to the
+input as <input>.patched.exe. The input file is never modified.
 
 Requires Python 3.8+. No external dependencies.
 
 Exit codes:
-    0  All patches applied successfully
+    0  All applicable patches applied successfully (or already present)
     1  Input file not found / not readable
-    2  Pre-patch byte verification failed (wrong game version, already patched,
-       or unexpected bytes at one of the target offsets)
+    2  Pre-patch byte verification failed (unknown bytes at offset)
     3  Output file could not be written
 """
 
 import hashlib
 import os
 import shutil
-import struct
 import sys
 
 
 # Each patch entry:
-#   (file_offset, expected_old_bytes_hex, new_bytes_hex, description)
+#   (file_offset, [valid_before_hex_list], new_hex, description)
 #
-# All offsets are absolute file offsets (not virtual addresses).
-# Pre-patch verification: if the bytes at any offset do not match
-# expected_old_bytes_hex, the script aborts with exit code 2 and the
-# output file is deleted. This prevents silently corrupting a binary
-# of an unexpected version.
+# `valid_before_hex_list` is a list of acceptable pre-patch byte patterns.
+# - For unpatched input: the first pattern in the list is expected.
+# - For already-patched input: a later pattern in the list is expected,
+#   and the script will skip the patch (idempotent).
+#
+# If the actual bytes match none of the patterns, the script aborts
+# with exit code 2.
 PATCHES = [
-    # Constant block at file offset 0x475b080 (virtual address 0x14475c880).
-    # This block holds the engine's primary target-FPS / per-frame-delta
-    # constants used by the frame-timing gate at virtual address 0x140d9edc0.
+    # === Framerate cap patch (5 patches) ===
+    # Each accepts the original (unpatched) bytes OR the post-60fps-patch
+    # bytes. If the input already has the post-patch bytes, no write
+    # happens for that offset.
     (
         0x0475B080,
-        "0000f041",
-        "00007042",
-        "Target FPS: 30.0f -> 60.0f",
+        ["0000f041", "00007042"],   # 30.0f (original) OR 60.0f (already patched)
+        "00007042",                 # final: 60.0f
+        "FPS cap: target FPS 30.0f -> 60.0f",
     ),
     (
         0x0475B084,
-        "00007041",
-        "0000f041",
-        "Half-rate companion: 15.0f -> 30.0f",
+        ["00007041", "0000f041"],   # 15.0f (original) OR 30.0f (already patched)
+        "0000f041",                 # final: 30.0f
+        "FPS cap: half-rate 15.0f -> 30.0f",
     ),
     (
         0x0475B088,
-        "8988083d",
-        "8988883c",
-        "Per-frame delta (primary): 1/30 -> 1/60",
+        ["8988083d", "8988883c"],   # 1/30 (original) OR 1/60 (already patched)
+        "8988883c",                 # final: 1/60
+        "FPS cap: per-frame delta 1/30 -> 1/60 (primary)",
     ),
-    # Two additional 1/30 constants elsewhere in .data. These feed the
-    # simulation step's fixed-delta logic. Patching them is required for
-    # the simulation to advance by 1/60 s per tick instead of 1/30 s.
     (
         0x047C0630,
-        "8988083d",
+        ["8988083d", "8988883c"],
         "8988883c",
-        "Per-frame delta (secondary): 1/30 -> 1/60",
+        "FPS cap: per-frame delta 1/30 -> 1/60 (secondary)",
     ),
     (
         0x047C0DD8,
-        "8988083d",
+        ["8988083d", "8988883c"],
         "8988883c",
-        "Fixed simulation delta: 1/30 -> 1/60",
+        "FPS cap: fixed simulation delta 1/30 -> 1/60",
+    ),
+    # === Cutscene desync patch (1 patch) ===
+    # Accepts the original `je` opcode (0x74) OR the patched `jmp` opcode
+    # (0xEB). If already patched, skip.
+    (
+        0x0D9E4DF,
+        ["74", "eb"],               # je (original) OR jmp (already patched)
+        "eb",                       # final: jmp
+        "Cutscene desync: je -> jmp (force variable-delta path)",
     ),
 ]
 
@@ -96,19 +118,15 @@ def main():
         sys.stderr.write("ERROR: input file not found: %s\n" % input_path)
         return 1
 
-    # Copy input to output, then patch in place
     try:
         shutil.copy2(input_path, output_path)
     except OSError as e:
         sys.stderr.write("ERROR: cannot copy to output: %s\n" % e)
         return 3
 
-    # Read original bytes for verification
     with open(input_path, "rb") as f:
         original = f.read()
 
-    # Verify size is plausible (the target binary is ~81 MB; allow any size
-    # large enough to contain all patch offsets)
     max_offset = max(p[0] for p in PATCHES) + 4
     if len(original) < max_offset:
         sys.stderr.write(
@@ -118,56 +136,59 @@ def main():
         os.remove(output_path)
         return 2
 
-    # Apply patches
     applied = 0
     skipped = 0
     with open(output_path, "r+b") as f:
-        for (offset, expected_hex, new_hex, desc) in PATCHES:
-            expected = bytes.fromhex(expected_hex)
+        for (offset, valid_before_list, new_hex, desc) in PATCHES:
             new = bytes.fromhex(new_hex)
-
             f.seek(offset)
-            actual = f.read(len(expected))
+            actual = f.read(len(new))
 
-            if actual != expected:
+            # Check if the actual bytes match any of the valid pre-patch
+            # patterns (which includes the post-patch value).
+            matched_pattern = None
+            for valid_hex in valid_before_list:
+                if actual == bytes.fromhex(valid_hex):
+                    matched_pattern = valid_hex
+                    break
+
+            if matched_pattern is None:
                 sys.stderr.write(
                     "VERIFY FAIL at file offset 0x%08x\n"
-                    "  expected (pre-patch): %s\n"
-                    "  actual:               %s\n"
-                    "  description:           %s\n"
+                    "  expected one of: %s\n"
+                    "  actual:           %s\n"
+                    "  desc:             %s\n"
                     "  This usually means the input is not the expected "
-                    "build of Kamiwaza.exe, or has already been patched.\n"
-                    % (offset, expected_hex, actual.hex(), desc)
+                    "build of Kamiwaza.exe.\n"
+                    % (offset, ", ".join(valid_before_list), actual.hex(), desc)
                 )
                 os.remove(output_path)
                 return 2
 
+            if matched_pattern == new_hex:
+                # Already patched - skip
+                print("already-patched 0x%08x: %s == %s  (%s) - skipping"
+                      % (offset, matched_pattern, new_hex, desc))
+                skipped += 1
+                continue
+
             f.seek(offset)
             f.write(new)
-            print(
-                "patched 0x%08x: %s -> %s  (%s)"
-                % (offset, expected_hex, new_hex, desc)
-            )
+            print("patched 0x%08x: %s -> %s  (%s)"
+                  % (offset, matched_pattern, new_hex, desc))
             applied += 1
 
-    # Hash the patched output
     with open(output_path, "rb") as f:
         patched_bytes = f.read()
-
-    md5 = hashlib.md5(patched_bytes).hexdigest()
-    sha1 = hashlib.sha1(patched_bytes).hexdigest()
 
     print("")
     print("input:  %s" % input_path)
     print("output: %s" % output_path)
     print("size:   %d bytes" % len(patched_bytes))
-    print("md5:    %s" % md5)
-    print("sha1:   %s" % sha1)
-    print("")
-    print("patches applied: %d / %d" % (applied, len(PATCHES)))
-
-    if skipped:
-        sys.stderr.write("WARNING: %d patch(es) skipped\n" % skipped)
+    print("md5:    %s" % hashlib.md5(patched_bytes).hexdigest())
+    print("sha1:   %s" % hashlib.sha1(patched_bytes).hexdigest())
+    print("patches applied: %d / %d  (already-patched: %d)"
+          % (applied, len(PATCHES), skipped))
     return 0
 
 
