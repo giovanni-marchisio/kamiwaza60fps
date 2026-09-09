@@ -152,19 +152,19 @@ FrameRateLimit=60.000000
 
 ## Applying the patch
 
-The included `patch_kamiwaza_combined.py` script applies all six byte
+The included `patch_kamiwaza_60fps.py` script applies all six byte
 changes. It does not modify the input file; a new `<input>.patched.exe`
 is produced.
 
 ```bash
-python3 patch_kamiwaza_combined.py Kamiwaza.exe
+python3 patch_kamiwaza_60fps.py Kamiwaza.exe
 # Produces Kamiwaza.patched.exe in the same directory.
 ```
 
 Or with an explicit output path:
 
 ```bash
-python3 patch_kamiwaza_combined.py Kamiwaza.exe Kamiwaza_60fps.exe
+python3 patch_kamiwaza_60fps.py Kamiwaza.exe Kamiwaza_60fps.exe
 ```
 
 The script is **idempotent**: it accepts both the original (unpatched)
